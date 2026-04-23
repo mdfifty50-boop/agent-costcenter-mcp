@@ -1,6 +1,6 @@
 {
   "name": "agent-costcenter-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server for per-agent cost attribution, budget management, and spend analytics across AI agent fleets",
   "type": "module",
   "main": "src/index.js",
