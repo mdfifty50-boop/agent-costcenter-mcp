@@ -1,58 +1,10 @@
 /**
- * In-memory storage for agent cost center data.
- * All state lives in Maps — no persistence, no dependencies.
+ * SQLite-backed storage for agent cost center data.
+ * All state persists to ~/.agent-costcenter-mcp/costs.db
  */
 
 import { resolveModelPricing, calculateCost } from './pricing.js';
-
-// ── Core stores ──────────────────────────────────────
-
-/** @type {Map<string, AgentRecord>} */
-export const agents = new Map();
-
-/** @type {Map<string, BudgetAlert>} */
-export const budgetAlerts = new Map();
-
-// ── Types (JSDoc) ────────────────────────────────────
-
-/**
- * @typedef {Object} LLMCall
- * @property {string} model
- * @property {number} input_tokens
- * @property {number} output_tokens
- * @property {number} cost_usd
- * @property {string} timestamp
- */
-
-/**
- * @typedef {Object} ToolCallEntry
- * @property {string} tool_name
- * @property {number} duration_ms
- * @property {number} cost_usd
- * @property {string} timestamp
- */
-
-/**
- * @typedef {Object} AgentRecord
- * @property {string} agent_id
- * @property {string} team
- * @property {string} project
- * @property {string} default_model
- * @property {number|null} budget_cap_usd
- * @property {number} total_llm_cost_usd
- * @property {number} total_tool_cost_usd
- * @property {number} total_llm_calls
- * @property {LLMCall[]} llm_calls
- * @property {ToolCallEntry[]} tool_calls
- * @property {string} registered_at
- */
-
-/**
- * @typedef {Object} BudgetAlert
- * @property {string} agent_id
- * @property {number} threshold_usd
- * @property {'warn'|'block'} action
- */
+import { getDb } from './db.js';
 
 // ── Agent management ─────────────────────────────────
 
@@ -60,32 +12,74 @@ export const budgetAlerts = new Map();
  * Register a new agent or update an existing one.
  */
 export function registerAgent({ agent_id, team, project, model, budget_cap_usd }) {
-  const existing = agents.get(agent_id);
-  const record = {
+  const db = getDb();
+  const now = new Date().toISOString();
+
+  const existing = db.prepare('SELECT * FROM agents WHERE agent_id = ?').get(agent_id);
+
+  db.prepare(`
+    INSERT INTO agents (agent_id, team, project, default_model, budget_cap_usd, registered_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(agent_id) DO UPDATE SET
+      team = excluded.team,
+      project = excluded.project,
+      default_model = excluded.default_model,
+      budget_cap_usd = excluded.budget_cap_usd
+  `).run(
     agent_id,
-    team: team || (existing?.team ?? ''),
-    project: project || (existing?.project ?? ''),
-    default_model: model,
-    budget_cap_usd: budget_cap_usd ?? (existing?.budget_cap_usd ?? null),
-    total_llm_cost_usd: existing?.total_llm_cost_usd ?? 0,
-    total_tool_cost_usd: existing?.total_tool_cost_usd ?? 0,
-    total_llm_calls: existing?.total_llm_calls ?? 0,
-    llm_calls: existing?.llm_calls ?? [],
-    tool_calls: existing?.tool_calls ?? [],
-    registered_at: existing?.registered_at ?? new Date().toISOString(),
+    team || existing?.team || '',
+    project || existing?.project || '',
+    model,
+    budget_cap_usd !== undefined ? budget_cap_usd : (existing?.budget_cap_usd ?? null),
+    existing?.registered_at || now
+  );
+
+  return _getAgentRecord(agent_id);
+}
+
+function _getAgentRecord(agent_id) {
+  const db = getDb();
+  const agent = db.prepare('SELECT * FROM agents WHERE agent_id = ?').get(agent_id);
+  if (!agent) return null;
+
+  const llmCalls = db.prepare('SELECT * FROM cost_entries WHERE agent_id = ? ORDER BY timestamp ASC').all(agent_id);
+  const toolCalls = db.prepare('SELECT * FROM tool_calls WHERE agent_id = ? ORDER BY timestamp ASC').all(agent_id);
+
+  const total_llm_cost_usd = llmCalls.reduce((s, r) => s + r.cost_usd, 0);
+  const total_tool_cost_usd = toolCalls.reduce((s, r) => s + r.cost_usd, 0);
+  const total_llm_calls = llmCalls.length;
+
+  return {
+    agent_id: agent.agent_id,
+    team: agent.team,
+    project: agent.project,
+    default_model: agent.default_model,
+    budget_cap_usd: agent.budget_cap_usd,
+    total_llm_cost_usd,
+    total_tool_cost_usd,
+    total_llm_calls,
+    llm_calls: llmCalls.map((r) => ({
+      model: r.model,
+      input_tokens: r.input_tokens,
+      output_tokens: r.output_tokens,
+      cost_usd: r.cost_usd,
+      timestamp: r.timestamp,
+    })),
+    tool_calls: toolCalls.map((r) => ({
+      tool_name: r.tool_name,
+      duration_ms: r.duration_ms,
+      cost_usd: r.cost_usd,
+      timestamp: r.timestamp,
+    })),
+    registered_at: agent.registered_at,
   };
-  agents.set(agent_id, record);
-  return record;
 }
 
 // ── LLM call logging ────────────────────────────────
 
-/**
- * Log an LLM API call. Auto-calculates cost from pricing table if no override.
- * Returns the computed cost details.
- */
 export function logLLMCall({ agent_id, model, input_tokens, output_tokens, cost_override_usd }) {
-  const agent = agents.get(agent_id);
+  const db = getDb();
+  const agent = db.prepare('SELECT * FROM agents WHERE agent_id = ?').get(agent_id);
   if (!agent) throw new Error(`Agent "${agent_id}" not registered. Call register_agent first.`);
 
   let cost_usd;
@@ -93,26 +87,21 @@ export function logLLMCall({ agent_id, model, input_tokens, output_tokens, cost_
     cost_usd = cost_override_usd;
   } else {
     const pricing = resolveModelPricing(model);
-    if (pricing) {
-      cost_usd = calculateCost(input_tokens, output_tokens, pricing);
-    } else {
-      cost_usd = 0; // unknown model, zero cost (caller should provide override)
-    }
+    cost_usd = pricing ? calculateCost(input_tokens, output_tokens, pricing) : 0;
   }
 
-  const entry = {
-    model,
-    input_tokens,
-    output_tokens,
-    cost_usd,
-    timestamp: new Date().toISOString(),
-  };
+  db.prepare(`
+    INSERT INTO cost_entries (agent_id, department, model, input_tokens, output_tokens, cost_usd, task_id, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(agent_id, agent.team, model, input_tokens, output_tokens, cost_usd, '', new Date().toISOString());
 
-  agent.llm_calls.push(entry);
-  agent.total_llm_cost_usd += cost_usd;
-  agent.total_llm_calls += 1;
+  const totals = db.prepare(`
+    SELECT COALESCE(SUM(ce.cost_usd), 0) AS llm_total, COALESCE(SUM(tc.cost_usd), 0) AS tool_total
+    FROM (SELECT SUM(cost_usd) AS cost_usd FROM cost_entries WHERE agent_id = ?) ce,
+         (SELECT SUM(cost_usd) AS cost_usd FROM tool_calls WHERE agent_id = ?) tc
+  `).get(agent_id, agent_id);
 
-  const totalSpend = agent.total_llm_cost_usd + agent.total_tool_cost_usd;
+  const totalSpend = (totals.llm_total || 0) + (totals.tool_total || 0);
   const budgetRemaining = agent.budget_cap_usd !== null
     ? Math.max(0, agent.budget_cap_usd - totalSpend)
     : null;
@@ -129,55 +118,45 @@ export function logLLMCall({ agent_id, model, input_tokens, output_tokens, cost_
 
 // ── Tool call logging ───────────────────────────────
 
-/**
- * Log a tool/API call cost for an agent.
- */
 export function logToolCall({ agent_id, tool_name, duration_ms, cost_usd }) {
-  const agent = agents.get(agent_id);
+  const db = getDb();
+  const agent = db.prepare('SELECT * FROM agents WHERE agent_id = ?').get(agent_id);
   if (!agent) throw new Error(`Agent "${agent_id}" not registered. Call register_agent first.`);
 
-  const entry = {
-    tool_name,
-    duration_ms,
-    cost_usd: cost_usd || 0,
-    timestamp: new Date().toISOString(),
-  };
+  const cost = cost_usd || 0;
 
-  agent.tool_calls.push(entry);
-  agent.total_tool_cost_usd += entry.cost_usd;
+  db.prepare(`
+    INSERT INTO tool_calls (agent_id, tool_name, duration_ms, cost_usd, timestamp)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(agent_id, tool_name, duration_ms, cost, new Date().toISOString());
+
+  const total = db.prepare('SELECT COALESCE(SUM(cost_usd), 0) AS total FROM tool_calls WHERE agent_id = ?').get(agent_id).total;
 
   return {
     logged: true,
-    tool_cost_usd: round(entry.cost_usd),
-    total_tool_costs_usd: round(agent.total_tool_cost_usd),
+    tool_cost_usd: round(cost),
+    total_tool_costs_usd: round(total),
   };
 }
 
 // ── Cost reports ────────────────────────────────────
 
-/**
- * Generate a cost report scoped by agent, team, project, or all.
- */
 export function getCostReport({ scope, filter }) {
-  let targetAgents = [];
+  const db = getDb();
+  let targetAgentIds = [];
 
   if (scope === 'agent') {
-    const a = agents.get(filter);
-    if (a) targetAgents = [a];
+    const a = db.prepare('SELECT agent_id FROM agents WHERE agent_id = ?').get(filter);
+    if (a) targetAgentIds = [a.agent_id];
   } else if (scope === 'team') {
-    for (const a of agents.values()) {
-      if (a.team === filter) targetAgents.push(a);
-    }
+    targetAgentIds = db.prepare('SELECT agent_id FROM agents WHERE team = ?').all(filter).map((r) => r.agent_id);
   } else if (scope === 'project') {
-    for (const a of agents.values()) {
-      if (a.project === filter) targetAgents.push(a);
-    }
+    targetAgentIds = db.prepare('SELECT agent_id FROM agents WHERE project = ?').all(filter).map((r) => r.agent_id);
   } else {
-    // 'all'
-    targetAgents = [...agents.values()];
+    targetAgentIds = db.prepare('SELECT agent_id FROM agents').all().map((r) => r.agent_id);
   }
 
-  if (targetAgents.length === 0) {
+  if (targetAgentIds.length === 0) {
     return { scope, filter: filter || null, total_spend_usd: 0, agent_count: 0, agents: [], model_breakdown: {} };
   }
 
@@ -185,71 +164,62 @@ export function getCostReport({ scope, filter }) {
   const modelTotals = {};
   const agentBreakdowns = [];
 
-  for (const agent of targetAgents) {
-    const agentTotal = agent.total_llm_cost_usd + agent.total_tool_cost_usd;
+  for (const aid of targetAgentIds) {
+    const record = _getAgentRecord(aid);
+    if (!record) continue;
+
+    const agentTotal = record.total_llm_cost_usd + record.total_tool_cost_usd;
     totalSpend += agentTotal;
 
-    // Per-model breakdown for this agent
     const perModel = {};
-    for (const call of agent.llm_calls) {
-      if (!perModel[call.model]) {
-        perModel[call.model] = { calls: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 };
-      }
+    for (const call of record.llm_calls) {
+      if (!perModel[call.model]) perModel[call.model] = { calls: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 };
       perModel[call.model].calls += 1;
       perModel[call.model].cost_usd += call.cost_usd;
       perModel[call.model].input_tokens += call.input_tokens;
       perModel[call.model].output_tokens += call.output_tokens;
 
-      // Accumulate global model totals
-      if (!modelTotals[call.model]) {
-        modelTotals[call.model] = { calls: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 };
-      }
+      if (!modelTotals[call.model]) modelTotals[call.model] = { calls: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 };
       modelTotals[call.model].calls += 1;
       modelTotals[call.model].cost_usd += call.cost_usd;
       modelTotals[call.model].input_tokens += call.input_tokens;
       modelTotals[call.model].output_tokens += call.output_tokens;
     }
 
-    // Round model costs
     for (const m of Object.values(perModel)) {
       m.cost_usd = round(m.cost_usd);
       m.avg_cost_per_call = m.calls > 0 ? round(m.cost_usd / m.calls) : 0;
     }
 
     agentBreakdowns.push({
-      agent_id: agent.agent_id,
-      team: agent.team,
-      project: agent.project,
-      llm_cost_usd: round(agent.total_llm_cost_usd),
-      tool_cost_usd: round(agent.total_tool_cost_usd),
+      agent_id: record.agent_id,
+      team: record.team,
+      project: record.project,
+      llm_cost_usd: round(record.total_llm_cost_usd),
+      tool_cost_usd: round(record.total_tool_cost_usd),
       total_cost_usd: round(agentTotal),
-      total_calls: agent.total_llm_calls,
-      percentage_of_total: 0, // filled below
+      total_calls: record.total_llm_calls,
+      percentage_of_total: 0,
       model_breakdown: perModel,
     });
   }
 
-  // Compute percentages
   for (const ab of agentBreakdowns) {
-    ab.percentage_of_total = totalSpend > 0
-      ? round((ab.total_cost_usd / totalSpend) * 100)
-      : 0;
+    ab.percentage_of_total = totalSpend > 0 ? round((ab.total_cost_usd / totalSpend) * 100) : 0;
   }
 
-  // Round global model totals
   for (const m of Object.values(modelTotals)) {
     m.cost_usd = round(m.cost_usd);
     m.avg_cost_per_call = m.calls > 0 ? round(m.cost_usd / m.calls) : 0;
   }
 
-  // Sort agents by cost descending
   agentBreakdowns.sort((a, b) => b.total_cost_usd - a.total_cost_usd);
 
   return {
     scope,
     filter: filter || null,
     total_spend_usd: round(totalSpend),
-    agent_count: targetAgents.length,
+    agent_count: targetAgentIds.length,
     agents: agentBreakdowns,
     model_breakdown: modelTotals,
   };
@@ -257,34 +227,38 @@ export function getCostReport({ scope, filter }) {
 
 // ── Budget management ───────────────────────────────
 
-/**
- * Set a budget alert threshold for an agent.
- */
 export function setBudgetAlert({ agent_id, threshold_usd, action }) {
-  const agent = agents.get(agent_id);
+  const db = getDb();
+  const agent = db.prepare('SELECT * FROM agents WHERE agent_id = ?').get(agent_id);
   if (!agent) throw new Error(`Agent "${agent_id}" not registered.`);
 
-  const alert = { agent_id, threshold_usd, action };
-  budgetAlerts.set(agent_id, alert);
+  db.prepare(`
+    INSERT INTO budget_alerts (agent_id, threshold_usd, action)
+    VALUES (?, ?, ?)
+    ON CONFLICT(agent_id) DO UPDATE SET threshold_usd = excluded.threshold_usd, action = excluded.action
+  `).run(agent_id, threshold_usd, action);
+
+  const record = _getAgentRecord(agent_id);
+  const spent = record.total_llm_cost_usd + record.total_tool_cost_usd;
+
   return {
     set: true,
     agent_id,
     threshold_usd,
     action,
-    current_spend_usd: round(agent.total_llm_cost_usd + agent.total_tool_cost_usd),
+    current_spend_usd: round(spent),
   };
 }
 
-/**
- * Check if an agent is within its budget.
- */
 export function checkBudget(agent_id) {
-  const agent = agents.get(agent_id);
+  const db = getDb();
+  const agent = db.prepare('SELECT * FROM agents WHERE agent_id = ?').get(agent_id);
   if (!agent) throw new Error(`Agent "${agent_id}" not registered.`);
 
-  const spent = agent.total_llm_cost_usd + agent.total_tool_cost_usd;
+  const record = _getAgentRecord(agent_id);
+  const spent = record.total_llm_cost_usd + record.total_tool_cost_usd;
   const budget = agent.budget_cap_usd;
-  const alert = budgetAlerts.get(agent_id);
+  const alertRow = db.prepare('SELECT * FROM budget_alerts WHERE agent_id = ?').get(agent_id);
 
   if (budget === null) {
     return {
@@ -293,7 +267,7 @@ export function checkBudget(agent_id) {
       budget_usd: null,
       remaining_usd: null,
       percentage_used: null,
-      action_if_exceeded: alert?.action || null,
+      action_if_exceeded: alertRow?.action || null,
       note: 'No budget cap set for this agent',
     };
   }
@@ -304,41 +278,41 @@ export function checkBudget(agent_id) {
     budget_usd: budget,
     remaining_usd: round(Math.max(0, budget - spent)),
     percentage_used: round((spent / budget) * 100),
-    action_if_exceeded: alert?.action || 'warn',
+    action_if_exceeded: alertRow?.action || 'warn',
   };
 }
 
 // ── Anomaly detection ───────────────────────────────
 
-/**
- * Find agents with unusual spending: per-call avg 2x+ above their own historical average.
- */
 export function getCostAnomalies() {
+  const db = getDb();
+  const agentIds = db.prepare('SELECT agent_id FROM agents').all().map((r) => r.agent_id);
   const anomalies = [];
 
-  for (const agent of agents.values()) {
-    if (agent.llm_calls.length < 3) continue; // need at least 3 calls to detect anomaly
+  for (const aid of agentIds) {
+    const costs = db.prepare(
+      'SELECT cost_usd FROM cost_entries WHERE agent_id = ? ORDER BY timestamp ASC'
+    ).all(aid).map((r) => r.cost_usd);
 
-    const costs = agent.llm_calls.map(c => c.cost_usd);
+    if (costs.length < 3) continue;
+
     const overallAvg = costs.reduce((s, c) => s + c, 0) / costs.length;
-
     if (overallAvg === 0) continue;
 
-    // Check recent calls (last 3) vs historical average
     const recentCalls = costs.slice(-3);
     const recentAvg = recentCalls.reduce((s, c) => s + c, 0) / recentCalls.length;
-
     const spikeFactor = recentAvg / overallAvg;
 
     if (spikeFactor >= 2) {
+      const agent = db.prepare('SELECT * FROM agents WHERE agent_id = ?').get(aid);
       anomalies.push({
-        agent_id: agent.agent_id,
+        agent_id: aid,
         team: agent.team,
         project: agent.project,
         expected_avg_usd: round(overallAvg),
         actual_recent_avg_usd: round(recentAvg),
         spike_factor: round(spikeFactor),
-        total_calls: agent.llm_calls.length,
+        total_calls: costs.length,
         severity: spikeFactor >= 5 ? 'critical' : spikeFactor >= 3 ? 'high' : 'medium',
       });
     }
@@ -349,88 +323,59 @@ export function getCostAnomalies() {
   return {
     anomaly_count: anomalies.length,
     anomalies,
-    checked_agents: agents.size,
+    checked_agents: agentIds.length,
   };
 }
 
 // ── Model comparison ────────────────────────────────
 
-/**
- * Compare cost efficiency across all models used.
- */
 export function compareModels() {
-  const modelStats = {};
+  const db = getDb();
+  const rows = db.prepare('SELECT model, COUNT(*) as calls, SUM(cost_usd) as cost, SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens FROM cost_entries GROUP BY model').all();
 
-  for (const agent of agents.values()) {
-    for (const call of agent.llm_calls) {
-      if (!modelStats[call.model]) {
-        modelStats[call.model] = {
-          model: call.model,
-          total_calls: 0,
-          total_cost_usd: 0,
-          total_input_tokens: 0,
-          total_output_tokens: 0,
-        };
-      }
-      const ms = modelStats[call.model];
-      ms.total_calls += 1;
-      ms.total_cost_usd += call.cost_usd;
-      ms.total_input_tokens += call.input_tokens;
-      ms.total_output_tokens += call.output_tokens;
-    }
+  if (rows.length === 0) {
+    return { model_count: 0, models: [], cheapest: null, most_expensive: null, total_spend_usd: 0 };
   }
 
-  const models = Object.values(modelStats).map(ms => {
-    const totalTokens = ms.total_input_tokens + ms.total_output_tokens;
+  const models = rows.map((r) => {
+    const totalTokens = r.input_tokens + r.output_tokens;
     return {
-      ...ms,
-      total_cost_usd: round(ms.total_cost_usd),
+      model: r.model,
+      total_calls: r.calls,
+      total_cost_usd: round(r.cost),
+      total_input_tokens: r.input_tokens,
+      total_output_tokens: r.output_tokens,
       total_tokens: totalTokens,
-      cost_per_1k_tokens: totalTokens > 0
-        ? round((ms.total_cost_usd / totalTokens) * 1000)
-        : 0,
-      avg_cost_per_call: ms.total_calls > 0
-        ? round(ms.total_cost_usd / ms.total_calls)
-        : 0,
+      cost_per_1k_tokens: totalTokens > 0 ? round((r.cost / totalTokens) * 1000) : 0,
+      avg_cost_per_call: r.calls > 0 ? round(r.cost / r.calls) : 0,
     };
   });
 
   models.sort((a, b) => a.cost_per_1k_tokens - b.cost_per_1k_tokens);
 
-  const cheapest = models.length > 0 ? models[0].model : null;
-  const mostExpensive = models.length > 0 ? models[models.length - 1].model : null;
-
   return {
     model_count: models.length,
     models,
-    cheapest,
-    most_expensive: mostExpensive,
+    cheapest: models[0].model,
+    most_expensive: models[models.length - 1].model,
     total_spend_usd: round(models.reduce((s, m) => s + m.total_cost_usd, 0)),
   };
 }
 
-// ── Summary (for resources) ─────────────────────────
+// ── Summary ─────────────────────────────────────────
 
-/**
- * Get a total summary across all agents.
- */
 export function getSummary() {
-  let totalLLM = 0;
-  let totalTool = 0;
-  let totalCalls = 0;
-
-  for (const agent of agents.values()) {
-    totalLLM += agent.total_llm_cost_usd;
-    totalTool += agent.total_tool_cost_usd;
-    totalCalls += agent.total_llm_calls;
-  }
+  const db = getDb();
+  const agentCount = db.prepare('SELECT COUNT(*) AS cnt FROM agents').get().cnt;
+  const llmTotals = db.prepare('SELECT COALESCE(SUM(cost_usd), 0) AS total, COUNT(*) AS calls FROM cost_entries').get();
+  const toolTotals = db.prepare('SELECT COALESCE(SUM(cost_usd), 0) AS total FROM tool_calls').get();
 
   return {
-    total_agents: agents.size,
-    total_llm_cost_usd: round(totalLLM),
-    total_tool_cost_usd: round(totalTool),
-    total_cost_usd: round(totalLLM + totalTool),
-    total_llm_calls: totalCalls,
+    total_agents: agentCount,
+    total_llm_cost_usd: round(llmTotals.total),
+    total_tool_cost_usd: round(toolTotals.total),
+    total_cost_usd: round(llmTotals.total + toolTotals.total),
+    total_llm_calls: llmTotals.calls,
   };
 }
 
@@ -444,6 +389,27 @@ function round(n) {
  * Clear all state — used in tests.
  */
 export function _resetAll() {
-  agents.clear();
-  budgetAlerts.clear();
+  const db = getDb();
+  db.exec('DELETE FROM cost_entries; DELETE FROM budgets; DELETE FROM agents; DELETE FROM tool_calls; DELETE FROM budget_alerts;');
 }
+
+// Keep the exported Maps for backward compatibility (tests may reference these)
+// These are now proxies that always read from DB — for test compatibility
+export const agents = {
+  get size() {
+    return getDb().prepare('SELECT COUNT(*) AS cnt FROM agents').get().cnt;
+  },
+  values() {
+    const agentIds = getDb().prepare('SELECT agent_id FROM agents').all().map((r) => r.agent_id);
+    return agentIds.map(_getAgentRecord).filter(Boolean)[Symbol.iterator]();
+  },
+};
+
+export const budgetAlerts = {
+  get(agent_id) {
+    return getDb().prepare('SELECT * FROM budget_alerts WHERE agent_id = ?').get(agent_id);
+  },
+  set(agent_id, alert) {
+    // handled via setBudgetAlert
+  },
+};

@@ -2,7 +2,7 @@
  * Tests for storage.js — agent registration, cost logging, reports, anomalies, budgets.
  */
 
-import { test, describe, beforeEach } from 'node:test';
+import { test, describe, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   registerAgent,
@@ -16,6 +16,13 @@ import {
   getSummary,
   _resetAll,
 } from './storage.js';
+import { _closeDb } from './db.js';
+
+// Redirect to a temp DB before any test opens it
+before(() => {
+  _closeDb();
+  process.env.COSTCENTER_DATA_DIR = '/tmp/costcenter-test-' + Date.now();
+});
 
 beforeEach(() => {
   _resetAll();
