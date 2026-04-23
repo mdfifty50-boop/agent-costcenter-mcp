@@ -1,0 +1,47 @@
+{
+  "serverInfo": {
+    "name": "agent-costcenter-mcp",
+    "version": "0.1.0",
+    "description": "Per-agent cost attribution and budget management for AI agent fleets via MCP — track spend by agent, team, project, detect anomalies, compare model efficiency",
+    "author": "THRONE AI",
+    "license": "MIT",
+    "homepage": "https://github.com/mdfifty50-boop/agent-costcenter-mcp",
+    "repository": "https://github.com/mdfifty50-boop/agent-costcenter-mcp"
+  },
+  "capabilities": {
+    "tools": [
+      { "name": "register_agent", "description": "Register an agent with team, project, model, and budget cap" },
+      { "name": "log_llm_call", "description": "Log an LLM API call with auto-calculated cost from pricing table" },
+      { "name": "log_tool_call", "description": "Log a tool or API call cost for an agent" },
+      { "name": "get_cost_report", "description": "Get cost breakdown by agent, team, project, or all agents" },
+      { "name": "set_budget_alert", "description": "Set spending threshold with warn or block action" },
+      { "name": "check_budget", "description": "Check if an agent is within its budget" },
+      { "name": "get_cost_anomalies", "description": "Find agents with unusual spending patterns (2x+ spike)" },
+      { "name": "compare_models", "description": "Compare cost efficiency across all models used" }
+    ],
+    "resources": [
+      { "uri": "costcenter://summary", "description": "Current total spend across all agents" },
+      { "uri": "costcenter://pricing", "description": "Built-in model pricing table (per 1M tokens)" }
+    ]
+  },
+  "categories": ["cost-management", "budget-tracking", "analytics", "developer-tools"],
+  "keywords": ["cost-attribution", "budget-management", "token-cost", "spend-analytics", "ai-agent", "model-comparison"],
+  "pricing": {
+    "free_tier": true,
+    "free_limit": "5 agents, in-memory only",
+    "starter": "$49/month — 25 agents, persistent storage, 30-day retention",
+    "pro": "$199/month — 100 agents, team dashboards, alerts, 90-day",
+    "enterprise": "$599/month — unlimited, SSO, custom integrations, 1-year"
+  },
+  "install": {
+    "npm": "npx agent-costcenter-mcp",
+    "claude_desktop": {
+      "mcpServers": {
+        "agent-costcenter": {
+          "command": "npx",
+          "args": ["agent-costcenter-mcp"]
+        }
+      }
+    }
+  }
+}
